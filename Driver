@@ -1,0 +1,24 @@
+const db = require('./db');
+const { clearOfferTimeout } = require('./driverMatcher');
+const { formatMoney } = require('./pricing');
+
+function getDriver(number) {
+  return db.prepare('SELECT * FROM drivers WHERE whatsapp_number = ?').get(number);
+}
+
+function currentOfferedRide(driverId) {
+  // Most recent ride still in "offered" state that lists this driver last.
+  const rides = db
+    .prepare(`SELECT * FROM rides WHERE status = 'offered' ORDER BY id DESC`)
+    .all();
+  return rides.find((r) => {
+    const ids = JSON.parse(r.offered_driver_ids || '[]');
+    return ids[ids.length - 1] === driverId;
+  });
+}
+
+function activeAssignedRide(driverId) {
+  return db
+    .prepare(
+      `SELECT * FROM rides WHERE driver_id = ?
+       AND status IN ('assigned','arrived','
