@@ -1,0 +1,14 @@
+const http = require('http');
+
+function startKeepAliveServer() {
+  const port = process.env.PORT || 3000;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('WhatsApp taxi bot is running.\n');
+  });
+  server.listen(port, () => {
+    console.log(`Keep-alive HTTP server listening on port ${port}`);
+  });
+}
+
+module.exports = { startKeepAliveServer };
