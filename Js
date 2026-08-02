@@ -1,0 +1,27 @@
+// Simple in-memory state machine store, keyed by WhatsApp number.
+// One process = one WhatsApp session, so in-memory is fine for a
+// single-instance deployment. For multi-instance scaling, swap this
+// for Redis.
+
+const sessions = new Map();
+
+function getSession(number) {
+  if (!sessions.has(number)) {
+    sessions.set(number, { state: 'IDLE', data: {} });
+  }
+  return sessions.get(number);
+}
+
+function setState(number, state, data = {}) {
+  const session = getSession(number);
+  session.state = state;
+  session.data = { ...session.data, ...data };
+  sessions.set(number, session);
+  return session;
+}
+
+function resetSession(number) {
+  sessions.set(number, { state: 'IDLE', data: {} });
+}
+
+module.exports = { getSession, setState, resetSession };
