@@ -1,0 +1,123 @@
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
+const qrcode = require('qrcode-terminal');
+
+const { handleCustomerMessage } = require('./customerFlow');
+const { handleDriverMessage, getDriver } = require('./driverFlow');
+
+const AUTH_FOLDER = process.env.AUTH_FOLDER || './baileys_auth';
+const logger = pino({ level: 'silent' }); // set to 'info' for verbose Baileys logs
+
+/** Extracts plain text from any Baileys message type we care about. */
+function extractText(message) {
+  if (!message) return '';
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    ''
+  );
+}
+
+/** Extracts { latitude, longitude, description } from a location message, if present. */
+function extractLocation(message) {
+  const loc = message?.locationMessage;
+  if (!loc) return null;
+  return {
+    latitude: loc.degreesLatitude,
+    longitude: loc.degreesLongitude,
+    description: loc.name || loc.address || 'Shared location',
+  };
+}
+
+async function createBot() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false, // we render the QR ourselves for a consistent look
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('Scan this QR code with WhatsApp (Linked Devices):');
+      qrcode.generate(qr, { small: true });
+    }
+
+    if (connection === 'open') {
+      console.log('✅ WhatsApp bot is ready.');
+    }
+
+    if (connection === 'close') {
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      console.warn('Connection closed.', loggedOut ? 'Logged out — delete the auth folder and re-scan.' : 'Reconnecting...');
+      if (!loggedOut) {
+        createBot(); // reconnect (e.g. after a normal drop), reusing saved credentials
+      }
+    }
+  });
+
+  // Thin wrapper so customerFlow.js / driverFlow.js can stay transport-agnostic
+  // and keep using client.sendMessage('<number>@c.us', text).
+  const clientShim = {
+    sendMessage: async (target, text) => {
+      const number = target.replace('@c.us', '');
+      await sock.sendMessage(`${number}@s.whatsapp.net`, { text });
+    },
+  };
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const rawMsg of messages) {
+      try {
+        if (!rawMsg.message || rawMsg.key.fromMe) continue;
+
+        const jid = rawMsg.key.remoteJid;
+        // Ignore group messages and status broadcasts; this bot is 1:1 only.
+        if (!jid || jid.endsWith('@g.us') || jid === 'status@broadcast') continue;
+
+        const number = jid.split('@')[0];
+        const body = extractText(rawMsg.message).trim();
+        const location = extractLocation(rawMsg.message);
+
+        const msgShim = {
+          body,
+          location,
+          from: `${number}@c.us`,
+          isStatus: false,
+          reply: async (replyText) => {
+            await sock.sendMessage(jid, { text: replyText });
+          },
+        };
+
+        const driver = getDriver(number);
+        if (driver) {
+          await handleDriverMessage(msgShim, clientShim, number, driver);
+        } else {
+          await handleCustomerMessage(msgShim, clientShim, number);
+        }
+      } catch (err) {
+        console.error('Error handling message:', err);
+      }
+    }
+  });
+
+  return sock;
+}
+
+module.exports = { createBot };
