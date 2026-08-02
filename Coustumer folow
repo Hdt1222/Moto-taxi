@@ -1,0 +1,118 @@
+const db = require('./db');
+const { getSession, setState, resetSession } = require('./sessionStore');
+const { distanceKm, calculateFare, formatMoney } = require('./pricing');
+const { offerToNextDriver, clearOfferTimeout } = require('./driverMatcher');
+
+const STATUS_LABELS = {
+  pending: 'Waiting to search for a driver',
+  searching: 'Searching for a driver',
+  offered: 'Waiting for a driver to accept',
+  assigned: 'Driver assigned, on the way to you',
+  arrived: 'Driver has arrived at pickup',
+  in_progress: 'Ride in progress',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  no_driver: 'No drivers available right now',
+};
+
+function activeRideFor(number) {
+  return db
+    .prepare(
+      `SELECT * FROM rides WHERE customer_number = ?
+       AND status NOT IN ('completed','cancelled','no_driver')
+       ORDER BY id DESC LIMIT 1`
+    )
+    .get(number);
+}
+
+async function handleCustomerMessage(msg, client, from) {
+  const body = (msg.body || '').trim();
+  const lower = body.toLowerCase();
+  const session = getSession(from);
+
+  // Global commands, available in any state
+  if (['menu', 'start', 'hi', 'hello'].includes(lower)) {
+    resetSession(from);
+    await msg.reply(
+      `👋 Welcome to *MotoGo* ride booking.\n\n` +
+        `Reply:\n` +
+        `1️⃣ *book* — request a ride\n` +
+        `2️⃣ *status* — check your current ride\n` +
+        `3️⃣ *cancel* — cancel your current ride`
+    );
+    return;
+  }
+
+  if (lower === 'status') {
+    const ride = activeRideFor(from);
+    if (!ride) {
+      await msg.reply('You have no active ride. Reply *book* to request one.');
+      return;
+    }
+    await msg.reply(
+      `📍 Ride #${ride.id} status: *${STATUS_LABELS[ride.status] || ride.status}*` +
+        (ride.fare ? `\nFare: ${formatMoney(ride.fare)}` : '')
+    );
+    return;
+  }
+
+  if (lower === 'cancel') {
+    const ride = activeRideFor(from);
+    if (!ride) {
+      await msg.reply('You have no active ride to cancel.');
+      return;
+    }
+    clearOfferTimeout(ride.id);
+    db.prepare(
+      `UPDATE rides SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`
+    ).run(ride.id);
+    if (ride.driver_id) {
+      const driver = db.prepare('SELECT * FROM drivers WHERE id = ?').get(ride.driver_id);
+      if (driver) {
+        await client.sendMessage(
+          `${driver.whatsapp_number}@c.us`,
+          `❌ Ride #${ride.id} was cancelled by the customer.`
+        );
+        db.prepare(`UPDATE drivers SET status = 'online' WHERE id = ?`).run(driver.id);
+      }
+    }
+    resetSession(from);
+    await msg.reply('Your ride has been cancelled.');
+    return;
+  }
+
+  // State machine for an active booking flow
+  switch (session.state) {
+    case 'IDLE': {
+      if (lower === 'book') {
+        setState(from, 'AWAITING_PICKUP');
+        await msg.reply(
+          '📍 Please share your *pickup location* using WhatsApp\'s location ' +
+            'attachment (📎 → Location), or type an address/landmark.'
+        );
+      } else {
+        await msg.reply('Reply *menu* to see what I can help with.');
+      }
+      break;
+    }
+
+    case 'AWAITING_PICKUP': {
+      if (msg.location) {
+        setState(from, 'AWAITING_DESTINATION', {
+          pickupLat: msg.location.latitude,
+          pickupLng: msg.location.longitude,
+          pickupLabel: msg.location.description || 'Shared location',
+        });
+      } else if (body) {
+        setState(from, 'AWAITING_DESTINATION', { pickupLabel: body });
+      } else {
+        await msg.reply('Please share a location or type your pickup address.');
+        break;
+      }
+      await msg.reply(
+        '🎯 Got it. Now share your *destination* the same way (location pin or address).'
+      );
+      break;
+    }
+
+    case 'AWAITING_DESTINATION': {
