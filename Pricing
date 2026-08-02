@@ -1,0 +1,34 @@
+require('dotenv').config();
+
+const BASE_FARE = Number(process.env.BASE_FARE || 5000);
+const PER_KM_RATE = Number(process.env.PER_KM_RATE || 2000);
+const MINIMUM_FARE = Number(process.env.MINIMUM_FARE || 8000);
+const ROUND_TO = Number(process.env.ROUND_TO || 500);
+const CURRENCY = process.env.CURRENCY || 'Rp';
+
+/** Haversine distance in km between two lat/lng points. */
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function calculateFare(distanceKmValue) {
+  let fare = BASE_FARE + PER_KM_RATE * distanceKmValue;
+  fare = Math.max(fare, MINIMUM_FARE);
+  fare = Math.ceil(fare / ROUND_TO) * ROUND_TO;
+  return Math.round(fare);
+}
+
+function formatMoney(amount) {
+  return `${CURRENCY} ${amount.toLocaleString('id-ID')}`;
+}
+
+module.exports = { distanceKm, calculateFare, formatMoney };
