@@ -1,0 +1,84 @@
+const db = require('./db');
+const { distanceKm, formatMoney } = require('./pricing');
+require('dotenv').config();
+
+const OFFER_TIMEOUT_MS =
+  Number(process.env.DRIVER_OFFER_TIMEOUT_MIN || 2) * 60 * 1000;
+
+const pendingOffers = new Map(); // rideId -> timeout handle
+
+/** Online drivers, sorted nearest-first if the ride has pickup coords. */
+function findCandidateDrivers(ride) {
+  const drivers = db
+    .prepare(`SELECT * FROM drivers WHERE status = 'online'`)
+    .all();
+
+  const offeredIds = JSON.parse(ride.offered_driver_ids || '[]');
+  const remaining = drivers.filter((d) => !offeredIds.includes(d.id));
+
+  if (ride.pickup_lat != null && ride.pickup_lng != null) {
+    remaining.sort((a, b) => {
+      const da =
+        a.lat != null
+          ? distanceKm(ride.pickup_lat, ride.pickup_lng, a.lat, a.lng)
+          : Infinity;
+      const db_ =
+        b.lat != null
+          ? distanceKm(ride.pickup_lat, ride.pickup_lng, b.lat, b.lng)
+          : Infinity;
+      return da - db_;
+    });
+  }
+  return remaining;
+}
+
+/**
+ * Try to offer the ride to the next best driver.
+ * onOffer(driver, ride) is called to actually send the WhatsApp message.
+ * onNoDrivers(ride) is called when nobody is left to offer.
+ */
+async function offerToNextDriver(rideId, { onOffer, onNoDrivers }) {
+  const ride = db.prepare('SELECT * FROM rides WHERE id = ?').get(rideId);
+  if (!ride || !['pending', 'searching', 'offered'].includes(ride.status)) {
+    return;
+  }
+
+  const candidates = findCandidateDrivers(ride);
+  if (candidates.length === 0) {
+    db.prepare(
+      `UPDATE rides SET status = 'no_driver', updated_at = datetime('now') WHERE id = ?`
+    ).run(rideId);
+    onNoDrivers(ride);
+    return;
+  }
+
+  const driver = candidates[0];
+  const offeredIds = JSON.parse(ride.offered_driver_ids || '[]');
+  offeredIds.push(driver.id);
+
+  db.prepare(
+    `UPDATE rides SET status = 'offered', offered_driver_ids = ?, updated_at = datetime('now') WHERE id = ?`
+  ).run(JSON.stringify(offeredIds), rideId);
+
+  await onOffer(driver, ride);
+
+  const handle = setTimeout(() => {
+    const current = db.prepare('SELECT * FROM rides WHERE id = ?').get(rideId);
+    // If still waiting on this same offer, move on to the next driver.
+    if (current && current.status === 'offered') {
+      offerToNextDriver(rideId, { onOffer, onNoDrivers });
+    }
+  }, OFFER_TIMEOUT_MS);
+
+  pendingOffers.set(rideId, handle);
+}
+
+function clearOfferTimeout(rideId) {
+  const handle = pendingOffers.get(rideId);
+  if (handle) {
+    clearTimeout(handle);
+    pendingOffers.delete(rideId);
+  }
+}
+
+module.exports = { offerToNextDriver, clearOfferTimeout, formatMoney };
